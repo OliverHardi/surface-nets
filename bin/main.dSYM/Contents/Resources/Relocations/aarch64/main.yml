@@ -1,0 +1,5 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/oliver/Documents/vscode/surface_nets/bin/main'
+relocations:     []
+...
