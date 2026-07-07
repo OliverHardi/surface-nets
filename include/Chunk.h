@@ -9,6 +9,7 @@
 
 constexpr int CHUNK_SIZE = 32;
 
+class World;
 
 struct Vertex {
     glm::vec3 position;
@@ -39,26 +40,17 @@ enum class ChunkState {
 
 class Chunk {
 public:
-    enum Dir { POS_X, NEG_X, POS_Y, NEG_Y, POS_Z, NEG_Z };
+    enum Dir { POS_X, POS_Y, POS_Z, POS_XY, POS_XZ, POS_YZ, NEG_X, NEG_Y, NEG_Z, NEG_XY, NEG_XZ, NEG_YZ };
 
     Chunk() = default;
     ~Chunk();
 
     ChunkCoord coord{};
-    Chunk* neighbors[6] = { nullptr };
+    Chunk* neighbors[12] = { nullptr };
 
     ChunkState state = ChunkState::Pending;
-
-    float sample(int x, int y, int z) const {
-        x = std::clamp(x, 0, CHUNK_SIZE - 1);
-        y = std::clamp(y, 0, CHUNK_SIZE - 1);
-        z = std::clamp(z, 0, CHUNK_SIZE - 1);
-        return voxels[x][y][z];
-    }
-
-    float sample(glm::ivec3 pos) const {
-        return sample(pos.x, pos.y, pos.z);
-    }
+    
+    World* world = nullptr;
 
     void generateVoxels(const FastNoiseLite& noise);
     void buildMesh();
@@ -68,8 +60,23 @@ public:
 
     bool isHomogeneous = false;
 
+    inline int getIndex(int x, int y, int z) const {
+        if constexpr (CHUNK_SIZE == 32) {
+            return (x << 10) | (y << 5) | z;
+        } else {
+            return x * CHUNK_SIZE * CHUNK_SIZE + y * CHUNK_SIZE + z;
+        }
+    }
+
+    inline float getVoxel(int x, int y, int z) const {
+        return voxels[getIndex(x, y, z)];
+    }
+
+    float getVoxelNeighbors(int x, int y, int z) const;
+    float getVoxelWorld(int lx, int ly, int lz) const;
+
 private:
-    float voxels[CHUNK_SIZE][CHUNK_SIZE][CHUNK_SIZE];
+    float voxels[CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE]; // flat array for better cache locality
 
     std::vector<Vertex> vertices;
     std::vector<unsigned int> indices;
@@ -82,3 +89,6 @@ private:
     float maxValue = 0.0f;
 
 };
+
+
+

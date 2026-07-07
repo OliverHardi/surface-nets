@@ -19,7 +19,8 @@ glm::mat4 view = camera.getViewMatrix();
 glm::mat4 model = glm::mat4(1.0f);
 
 int main() {
-    camera.position = glm::vec3(16.0f, 16.0f, 50.0f);
+    // camera.position = glm::vec3(16.0f, 16.0f, 50.0f);
+    camera.position = glm::vec3(0.0f, 0.0f, 0.0f);
     
     if (!glfwInit()) {
         std::cerr << "Failed to init GLFW\n";
@@ -62,11 +63,15 @@ int main() {
 
 
     glEnable(GL_DEPTH_TEST);
+    // glDisable(GL_DEPTH_TEST);
 
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
+    
     // glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-
+    
+    // glEnable(GL_BLEND);
+    // glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
     glfwSetCursorPosCallback(window, mouseCallback);
@@ -118,7 +123,7 @@ int main() {
 
 TODO:
 
-switch to flat array chunks
+switch to flat array chunks - done
 
 fix meshing to use neighboring chunks for the edges
 
