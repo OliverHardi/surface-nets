@@ -4,6 +4,7 @@
 #include <chrono>
 #include <glm/glm.hpp>
 #include <glad/glad.h>
+#include <atomic>
 
 #include "FastNoiseLite.h"
 
@@ -31,10 +32,12 @@ struct ChunkCoordHash {
 };
 
 enum class ChunkState {
-    Pending,    // exists in map, voxels not yet filled
-    Generated,  // voxels filled, waiting for neighbors before meshing
-    Meshed,     // mesh built, waiting for GPU upload
-    Ready       // fully uploaded, can be drawn
+    Pending,
+    Generating,
+    Generated,
+    Meshing,
+    MeshReady,
+    Ready
 };
 
 
@@ -46,9 +49,9 @@ public:
     ~Chunk();
 
     ChunkCoord coord{};
-    Chunk* neighbors[12] = { nullptr };
 
-    ChunkState state = ChunkState::Pending;
+    // ChunkState state = ChunkState::Pending;
+    std::atomic<ChunkState> state{ChunkState::Pending};
     
     World* world = nullptr;
 
@@ -72,7 +75,6 @@ public:
         return voxels[getIndex(x, y, z)];
     }
 
-    float getVoxelNeighbors(int x, int y, int z) const;
     float getVoxelWorld(int lx, int ly, int lz) const;
 
 private:

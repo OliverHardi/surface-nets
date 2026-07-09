@@ -28,8 +28,11 @@ float Chunk::getVoxelWorld(int lx, int ly, int lz) const {
     glm::ivec3 ownerChunk = glm::ivec3(glm::floor(glm::vec3(worldVoxel) / float(CHUNK_SIZE)));
     glm::ivec3 localVoxel = worldVoxel - ownerChunk * CHUNK_SIZE;
 
-    Chunk* owner = world->getChunkIfGenerated(ChunkCoord{ownerChunk});
-    if (!owner) return 0.0f; // not generated (yet) — treat as empty
+    auto owner = world->getChunkIfGenerated(ChunkCoord{ownerChunk});
+
+    if (!owner)
+        return 0.0f;
+
     return owner->voxels[owner->getIndex(localVoxel.x, localVoxel.y, localVoxel.z)];
 }
 
@@ -53,8 +56,8 @@ void Chunk::generateVoxels(const FastNoiseLite& noise) {
                 glm::vec3 noisePos = worldPos * 1.5f;
                 float val = noise.GetNoise(noisePos.x, noisePos.y, noisePos.z);
 
-                float sdf = worldPos.y - 3.0f; // terrain height
-                // float sdf = val * 7.0f;
+                // float sdf = worldPos.y - 3.0f; // terrain height
+                float sdf = val * 7.0f;
                 // float sdf = glm::length(chunkPos - glm::vec3(CHUNK_SIZE * 0.5f)) - 10.0f; // sphere
 
 
@@ -66,9 +69,7 @@ void Chunk::generateVoxels(const FastNoiseLite& noise) {
         }
     }
 
-    // isHomogeneous = (minValue > 0.0f || maxValue < 0.0f);
-
-    state = ChunkState::Generated;
+    isHomogeneous = (minValue > 0.0f || maxValue < 0.0f);
 
     // auto endTime = std::chrono::high_resolution_clock::now();
     // std::cout << "Generated chunk at " << coord.position.x << ", " << coord.position.y << ", " << coord.position.z
@@ -93,46 +94,48 @@ void Chunk::buildMesh() {
     constexpr int H = CHUNK_SIZE + 2;
     constexpr int N = CHUNK_SIZE + 1;
 
+    static thread_local std::vector<float> halo(H * H * H);
+    static thread_local std::vector<glm::vec3> grad(H * H * H);
+    static thread_local std::vector<bool> gradComputed(H * H * H);
+    static thread_local std::vector<int> vertexIndex(N * N * N);
 
-    float halo[H * H * H];
-    for(int x = -1; x < H-1; x++)
-    for(int y = -1; y < H-1; y++)
-    for(int z = -1; z < H-1; z++){
-        halo[(x + 1) * H * H + (y + 1) * H + (z + 1)] = getVoxelWorld(x, y, z);
-    }
+    std::fill(gradComputed.begin(), gradComputed.end(), false);
+    std::fill(vertexIndex.begin(), vertexIndex.end(), -1);
+
+    auto haloIdx  = [&](int x, int y, int z) { return (x+1)*H*H + (y+1)*H + (z+1); };
+    auto gradIdx  = haloIdx; // same shape
+    auto vIdxOf   = [&](int x, int y, int z) { return (x+1)*N*N + (y+1)*N + (z+1); };
+
+    for (int x = -1; x < H-1; x++)
+    for (int y = -1; y < H-1; y++)
+    for (int z = -1; z < H-1; z++)
+        halo[haloIdx(x, y, z)] = getVoxelWorld(x, y, z);
 
     auto getVoxelHalo = [&](int x, int y, int z) -> float {
-        return halo[(x + 1) * H * H + (y + 1) * H + (z + 1)];
+        return halo[haloIdx(x, y, z)];
     };
 
     auto getVoxelExtended = [&](int x, int y, int z) -> float {
         if (x >= -1 && x <= CHUNK_SIZE && y >= -1 && y <= CHUNK_SIZE && z >= -1 && z <= CHUNK_SIZE)
-            return getVoxelHalo(x, y, z);      // fast path: cached
-        return getVoxelWorld(x, y, z);          // rare: only for the outermost corner layer
+            return getVoxelHalo(x, y, z);
+        return getVoxelWorld(x, y, z);
     };
-    
-    glm::vec3 grad[H][H][H];
-    bool gradComputed[H][H][H] = {}; // zero-initialized
 
     auto getGrad = [&](int x, int y, int z) -> const glm::vec3& {
-        int ix = x + 1, iy = y + 1, iz = z + 1;
-        if (!gradComputed[ix][iy][iz]) {
-            grad[ix][iy][iz] = {
+        int idx = haloIdx(x, y, z); // same shape as halo, so reuse haloIdx
+        if (!gradComputed[idx]) {
+            grad[idx] = {
                 getVoxelExtended(x+1, y, z) - getVoxelExtended(x-1, y, z),
                 getVoxelExtended(x, y+1, z) - getVoxelExtended(x, y-1, z),
                 getVoxelExtended(x, y, z+1) - getVoxelExtended(x, y, z-1)
             };
-            gradComputed[ix][iy][iz] = true;
+            gradComputed[idx] = true;
         }
-        return grad[ix][iy][iz];
+        return grad[idx];
     };
 
-    
-    int vertexIndex[N][N][N];
-    memset(vertexIndex, -1, sizeof(vertexIndex));
-
     auto getVertexIndex = [&](int x, int y, int z) -> int {
-        return vertexIndex[x+1][y+1][z+1];
+        return vertexIndex[vIdxOf(x, y, z)];
     };
 
     auto addQuad = [&](int a, int b, int c, int d) {
@@ -189,7 +192,8 @@ void Chunk::buildMesh() {
                     L.x*L.y*L.z*gradients[6] + I.x*L.y*L.z*gradients[7]
                 );
 
-                vertexIndex[x+1][y+1][z+1] = static_cast<int>(vertices.size());
+                // vertexIndex[x+1][y+1][z+1] = static_cast<int>(vertices.size());
+                vertexIndex[vIdxOf(x, y, z)] = static_cast<int>(vertices.size());
                 vertices.push_back({
                     glm::vec3(x, y, z) + L,
                     normal
@@ -251,14 +255,11 @@ void Chunk::buildMesh() {
             }
         }
     }
-        
 
-    state = ChunkState::Meshed;
-
-    auto endTime = std::chrono::high_resolution_clock::now();
-    std::cout << "Built mesh for chunk at " << coord.position.x << ", " << coord.position.y << ", " << coord.position.z
-              << " in " << std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count()
-              << " ms\n";
+    // auto endTime = std::chrono::high_resolution_clock::now();
+    // std::cout << "Built mesh for chunk at " << coord.position.x << ", " << coord.position.y << ", " << coord.position.z
+    //           << " in " << std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count()
+    //           << " ms\n";
 }
 
 void Chunk::uploadMesh() {

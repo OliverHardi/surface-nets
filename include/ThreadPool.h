@@ -15,7 +15,14 @@ public:
 
     void submit(std::function<void()> job);
 
+    void shutdown();
+
+    size_t pendingCount() const { return activeJobs.load(); }
+
 private:
+
+    std::atomic<size_t> activeJobs{0};
+
     void workerLoop();
 
     std::vector<std::thread> workers;

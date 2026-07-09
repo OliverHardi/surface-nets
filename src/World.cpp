@@ -4,6 +4,11 @@ World::World() {
     noise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
 }
 
+World::~World()
+{
+    generatePool.shutdown();
+    meshPool.shutdown();
+}
 
 static const glm::ivec3 kOffsets[12] = {
     { 1,  0,  0}, // +X
@@ -21,6 +26,36 @@ static const glm::ivec3 kOffsets[12] = {
 };
 
 
+std::shared_ptr<Chunk> World::getChunk(ChunkCoord coord) {
+    std::lock_guard lock(chunksMutex);
+
+    auto it = chunks.find(coord);
+
+    if (it == chunks.end())
+        return nullptr;
+
+    return it->second;
+}
+
+std::shared_ptr<Chunk> World::getChunkIfGenerated(ChunkCoord coord) {
+    std::lock_guard<std::mutex> lock(chunksMutex);
+
+    auto it = chunks.find(coord);
+
+    if (it == chunks.end())
+        return nullptr;
+
+    auto chunk = it->second;
+
+    if (chunk->state == ChunkState::Pending ||
+        chunk->state == ChunkState::Generating
+        // || chunk->state == ChunkState::Meshing
+    ) {
+        return nullptr;
+    }
+
+    return chunk;
+}
 
 float World::priority(ChunkCoord coord, glm::vec3 cameraPos, Frustum& frustum) {
     glm::vec3 chunkCenter = glm::vec3(coord.position) * float(CHUNK_SIZE)
@@ -36,71 +71,77 @@ float World::priority(ChunkCoord coord, glm::vec3 cameraPos, Frustum& frustum) {
     return dist;
 }
 
+// void World::sortByPriority(std::vector<ChunkCoord>& queue, glm::vec3 cameraPos, Frustum& frustum) {
+//     std::sort(queue.begin(), queue.end(),
+//         [&](const ChunkCoord& a, const ChunkCoord& b) {
+//             return priority(a, cameraPos, frustum) > priority(b, cameraPos, frustum);
+//         });
+// }
+
 void World::sortByPriority(std::vector<ChunkCoord>& queue, glm::vec3 cameraPos, Frustum& frustum) {
-    // Sort descending so the lowest-priority (closest) chunk is at .back(),
-    // letting us pop_back() in O(1) instead of erasing from the front.
-    std::sort(queue.begin(), queue.end(),
-        [&](const ChunkCoord& a, const ChunkCoord& b) {
-            return priority(a, cameraPos, frustum) > priority(b, cameraPos, frustum);
-        });
+    std::vector<float> priorities(queue.size());
+    for (size_t i = 0; i < queue.size(); i++)
+        priorities[i] = priority(queue[i], cameraPos, frustum);
+
+    std::vector<size_t> indices(queue.size());
+    std::iota(indices.begin(), indices.end(), 0);
+
+    std::sort(indices.begin(), indices.end(),
+        [&](size_t a, size_t b) { return priorities[a] > priorities[b]; });
+
+    std::vector<ChunkCoord> sorted(queue.size());
+    for (size_t i = 0; i < queue.size(); i++)
+        sorted[i] = queue[indices[i]];
+    queue = std::move(sorted);
 }
 
 void World::loadChunk(ChunkCoord coord) {
-    auto chunk = std::make_unique<Chunk>();
+    auto chunk = std::make_shared<Chunk>();
     chunk->world = this;
     chunk->coord = coord;
-    chunks[coord] = std::move(chunk);
-    linkNeighbors(coord);
+
+    // chunks[coord] = chunk;
+    {
+        std::lock_guard<std::mutex> lock(chunksMutex);
+        chunks[coord] = chunk;
+    }
+
     generateQueue.push_back(coord);
 }
 
 void World::unloadChunk(ChunkCoord coord) {
-    auto it = chunks.find(coord);
-    if (it == chunks.end()) return;
+    // auto it = chunks.find(coord);
+    // if (it == chunks.end()) return;
 
-    for (int i = 0; i < 12; i++) {
-        ChunkCoord neighborCoord{ coord.position + kOffsets[i] };
+    // chunks.erase(it);
+    {
+        std::lock_guard<std::mutex> lock(chunksMutex);
 
-        auto it = chunks.find(neighborCoord);
-        if (it != chunks.end())
-            it->second->neighbors[i] = nullptr;
+        auto it = chunks.find(coord);
+        if (it == chunks.end())
+            return;
+
+        chunks.erase(it);
     }
-
-    chunks.erase(it);
 
     // Remove from any pending queues (cheap since queues are small)
     auto removeFromQueue = [&](std::vector<ChunkCoord>& q) {
         q.erase(std::remove(q.begin(), q.end(), coord), q.end());
     };
     removeFromQueue(generateQueue);
-    removeFromQueue(meshCandidates);
-}
-
-void World::linkNeighbors(ChunkCoord coord) {
-    Chunk* self = chunks[coord].get();
-
-    for (int i = 0; i < 12; i++) {
-        // self's own positive-direction neighbor, if it exists
-        ChunkCoord neighborCoord{ coord.position + kOffsets[i] };
-        auto it = chunks.find(neighborCoord);
-        if (it != chunks.end()) {
-            self->neighbors[i] = it->second.get();
-            it->second->neighbors[i] = self;
-        }
-    }
+    removeFromQueue(meshQueue);
 }
 
 
 bool World::readyToMesh(ChunkCoord coord, glm::vec3 cameraPos) {
-    for( auto offset : kOffsets ) {
-        ChunkCoord neighborCoord{ coord.position + offset };
-        if (isOutOfRange(neighborCoord, cameraPos)) {
-            continue; // out of bounds, ignore
-        }
-        auto it = chunks.find(neighborCoord);
-        if (it == chunks.end() || it->second->state == ChunkState::Pending) {
-            return false; // neighbor not generated yet
-        }
+    for(auto offset : kOffsets) {
+        ChunkCoord neighborCoord{coord.position + offset};
+
+        if(isOutOfRange(neighborCoord, cameraPos))
+            continue;
+
+        if(!getChunkIfGenerated(neighborCoord))
+            return false;
     }
 
     return true;
@@ -121,117 +162,206 @@ void World::update(glm::vec3 cameraPos, Frustum& frustum) {
     for (int y = -VERTICAL_RENDER_DISTANCE; y <= VERTICAL_RENDER_DISTANCE; y++)
     for (int z = -RENDER_DISTANCE; z <= RENDER_DISTANCE; z++) {
         ChunkCoord coord{ center + glm::ivec3(x, y, z) };
-        if (chunks.find(coord) == chunks.end())
+        bool exists;
+        {
+            std::lock_guard lock(chunksMutex);
+            exists = chunks.find(coord) != chunks.end();
+        }
+        if (!exists)
             loadChunk(coord);
     }
 
     // --- Despawn chunks out of range ---
     std::vector<ChunkCoord> toUnload;
-    for (auto& [coord, chunk] : chunks) {
-        if (isOutOfRange(coord, cameraPos)) {
-            toUnload.push_back(coord);
+    {
+        std::lock_guard lock(chunksMutex);
+
+        for (auto& [coord, chunk] : chunks)
+        {
+            if (isOutOfRange(coord, cameraPos))
+                toUnload.push_back(coord);
         }
     }
     for (auto& coord : toUnload)
         unloadChunk(coord);
 
+
+
+    std::cout << "nums: " << generatePool.pendingCount() << ", " << meshPool.pendingCount() << std::endl;
+
     // --- Generate ---
-    if (worldTick == 0 && !generateQueue.empty()) {
+    if (!generateQueue.empty()) {
         sortByPriority(generateQueue, cameraPos, frustum);
     }
-    for (int i = 0; i < GEN_PER_FRAME && !generateQueue.empty(); i++) {
+
+    for (int i = 0;
+        !generateQueue.empty() && generatePool.pendingCount() < MAX_GEN_IN_FLIGHT; i++) {
+    // for (int i = 0; !generateQueue.empty(); i++) {
         ChunkCoord coord = generateQueue.back();
         generateQueue.pop_back();
 
-        auto it = chunks.find(coord);
-        if (it == chunks.end()) continue;
+        auto chunk = getChunk(coord);
 
-        Chunk* chunk = it->second.get();
-        chunk->generateVoxels(noise);
+        if (!chunk)
+            continue;
 
-        if(chunk->isHomogeneous) {
-            chunk->state = ChunkState::Ready;
-        } else {
-            meshCandidates.push_back(coord);
-            for (int i = 0; i < 12; i++) {
-                ChunkCoord neighborCoord{ coord.position + kOffsets[i] };
-                auto it = chunks.find(neighborCoord);
-                if (it == chunks.end()) continue;
+        chunk->state = ChunkState::Generating;
 
-                auto state = it->second->state;
-                if (state == ChunkState::Generated ||
-                    state == ChunkState::Meshed ||
-                    state == ChunkState::Ready) {
-                    meshCandidates.push_back(neighborCoord);
-                    // it->second->state = ChunkState::Generated;
+        generatePool.submit([this, chunk]
+        {
+            chunk->generateVoxels(noise);
+
+            std::lock_guard lock(generatedMutex);
+            generatedQueue.push(chunk);
+        });
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(generatedMutex);
+
+        while (!generatedQueue.empty()) {
+            auto chunk = generatedQueue.front();
+            generatedQueue.pop();
+
+            if (chunk->isHomogeneous)
+            {
+                chunk->state = ChunkState::Ready;
+            }
+            else
+            {
+                auto pushMeshCandidate = [&](ChunkCoord c) {
+                    if (std::find(meshQueue.begin(), meshQueue.end(), c) == meshQueue.end())
+                        meshQueue.push_back(c);
+                };
+
+                chunk->state = ChunkState::Generated;
+
+                pushMeshCandidate(chunk->coord);
+
+                for (int i = 0; i < 12; i++)
+                {
+                    ChunkCoord neighborCoord{ chunk->coord.position + kOffsets[i] };
+
+                    auto neighbor = getChunkIfGenerated(neighborCoord);
+
+                    if (!neighbor)
+                        continue;
+
+                    if (neighbor->state == ChunkState::Generated ||
+                        neighbor->state == ChunkState::Meshing || 
+                        neighbor->state == ChunkState::MeshReady ||
+                        neighbor->state == ChunkState::Ready
+                    ) {
+                        pushMeshCandidate(neighbor->coord);
+                    }
                 }
             }
         }
-        
     }
 
-    // for each mesh candidate
-    int chunksMeshed = 0;
+    // --- Start meshing jobs ---
 
-    for(auto& coord : meshCandidates) {
-        // check if neighbors are either generated or out of bounds
-        if(readyToMesh(coord, cameraPos)) {
-            auto it = chunks.find(coord);
-            if (it == chunks.end()) continue;
+    if (!meshQueue.empty()) {
+        sortByPriority(meshQueue, cameraPos, frustum);
+    }
+    int chunksStarted = 0;
 
-            Chunk* chunk = it->second.get();
-            chunk->buildMesh();
-            chunk->uploadMesh();
-            chunk->state = ChunkState::Ready;
-            // remove from mesh candidates
-            meshCandidates.erase(std::remove(meshCandidates.begin(), meshCandidates.end(), coord), meshCandidates.end());
-            chunksMeshed++;
-            if(chunksMeshed >= MESH_PER_FRAME) {
-                break; // only mesh a limited number of chunks per frame
+    for (size_t i = 0; 
+        i < meshQueue.size() && meshPool.pendingCount() < MAX_MESH_IN_FLIGHT;)
+    {
+        ChunkCoord coord = meshQueue[i];
+
+        if (readyToMesh(coord, cameraPos))
+        {
+            auto chunk = getChunk(coord);
+
+            if (chunk && chunk->state != ChunkState::Meshing)
+            {
+                chunk->state = ChunkState::Meshing;
+
+                meshPool.submit([this, chunk]
+                {
+                    chunk->buildMesh();
+
+                    chunk->state = ChunkState::MeshReady;
+
+                    std::lock_guard lock(meshFinishedMutex);
+                    meshFinishedQueue.push(chunk);
+                });
             }
+
+            meshQueue.erase(meshQueue.begin() + i);
+            ++chunksStarted;
+        }
+        else
+        {
+            ++i;
         }
     }
 
+    // --- Upload finished meshes ---
+    {
+        std::lock_guard lock(meshFinishedMutex);
 
-    worldTick = (worldTick + 1) % 30;
+        while (!meshFinishedQueue.empty())
+        {
+            auto chunk = meshFinishedQueue.front();
+            meshFinishedQueue.pop();
+
+            chunk->uploadMesh();
+            chunk->state = ChunkState::Ready;
+        }
+    }
+
 }
 
-void World::draw(Shader& shader, Frustum& frustum) {
-    for (auto& [coord, chunk] : chunks) {
-        if (chunk->state != ChunkState::Ready){ continue; } // only draw uploaded chunks
 
-        // aabb
+
+
+// void World::draw(Shader& shader, Frustum& frustum) {
+//     for (auto& [coord, chunk] : chunks) {
+//         if (chunk->state != ChunkState::Ready){ continue; } // only draw uploaded chunks
+
+//         // aabb
+//         glm::vec3 chunkMin = glm::vec3(coord.position * CHUNK_SIZE);
+//         glm::vec3 chunkMax = chunkMin + glm::vec3(CHUNK_SIZE);
+//         if (!frustum.intersectsAABB(chunkMin, chunkMax)){ continue; }
+
+//         glm::mat4 model = glm::translate(glm::mat4(1.0f),
+//             glm::vec3(coord.position * CHUNK_SIZE));
+//         shader.setMat4("model", model);
+//         chunk->draw();
+//     }
+// }
+
+void World::draw(Shader& shader, Frustum& frustum)
+{
+    std::vector<std::pair<ChunkCoord, std::shared_ptr<Chunk>>> visibleChunks;
+
+    {
+        std::lock_guard lock(chunksMutex);
+
+        for (auto& [coord, chunk] : chunks)
+            visibleChunks.push_back({coord, chunk});
+    }
+
+    for (auto& [coord, chunk] : visibleChunks)
+    {
+        if (chunk->state != ChunkState::Ready)
+            continue;
+
         glm::vec3 chunkMin = glm::vec3(coord.position * CHUNK_SIZE);
         glm::vec3 chunkMax = chunkMin + glm::vec3(CHUNK_SIZE);
-        if (!frustum.intersectsAABB(chunkMin, chunkMax)){ continue; }
 
-        glm::mat4 model = glm::translate(glm::mat4(1.0f),
-            glm::vec3(coord.position * CHUNK_SIZE));
+        if (!frustum.intersectsAABB(chunkMin, chunkMax))
+            continue;
+
+        glm::mat4 model = glm::translate(
+            glm::mat4(1.0f),
+            glm::vec3(coord.position * CHUNK_SIZE)
+        );
+
         shader.setMat4("model", model);
         chunk->draw();
     }
 }
-
-/*
-
-
-
-chunk is created and added to the generate queue
-marked as pending
-
-generate queue is simple, just partial sort by recomputed priority every few frames
-and generate n chunks per frame
-later move this to worker threads
-
-after a chunk is generated
-mark as generated instead of pending
-add to array of chunks to mesh
-
-every frame each of the generated chunks check the neighbors they rely on if they've been generated
-if they have, mesh the chunk and upload
-mark as ready
-
-once n chunks have been meshed in a single check, break out of the loop
-
-
-*/

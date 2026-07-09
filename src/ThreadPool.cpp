@@ -25,6 +25,7 @@ ThreadPool::~ThreadPool()
 
 void ThreadPool::submit(std::function<void()> job)
 {
+    activeJobs++;
     {
         std::lock_guard lock(queueMutex);
         jobs.push(std::move(job));
@@ -55,5 +56,28 @@ void ThreadPool::workerLoop()
         }
 
         job();
+        activeJobs--;
     }
+}
+
+void ThreadPool::shutdown()
+{
+    {
+        std::lock_guard lock(queueMutex);
+        stopping = true;
+
+        // Drop anything not yet started — don't drain the backlog
+        std::queue<std::function<void()>> empty;
+        std::swap(jobs, empty);
+    }
+
+    cv.notify_all();
+
+    for (auto& thread : workers)
+    {
+        if (thread.joinable())
+            thread.join();
+    }
+
+    workers.clear();
 }
